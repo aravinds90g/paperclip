@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -115,6 +115,36 @@ export async function observeCrossIssueInfluence(
     // rejecting these writes as run-less left live heartbeat runs unable to
     // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+
+    // A timer-woken run (heartbeat_timer) carries no source issue in its
+    // context snapshot, but a successful checkout stamps the issue's active run
+    // onto the issue row itself (checkoutRunId / executionRunId). For that case
+    // the checkout is the durable same-issue link, so a write from the run that
+    // holds the target issue's active checkout is same-issue influence: it
+    // returns no decision and spends no cap. Writes to issues this run does not
+    // hold a checkout for keep the existing behavior below — same-issue only by
+    // source issue, then cross-issue cap accounting.
+    const targetIssue = isUuidLike(input.targetIssueId)
+      ? await tx
+          .select({
+            id: issues.id,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(and(
+            eq(issues.id, input.targetIssueId),
+            eq(issues.companyId, input.companyId),
+          ))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    if (
+      targetIssue &&
+      (targetIssue.checkoutRunId === run.id || targetIssue.executionRunId === run.id)
+    ) {
+      return null;
+    }
+
     if (
       sourceIssueId !== null &&
       (sourceIssueId === input.targetIssueId ||

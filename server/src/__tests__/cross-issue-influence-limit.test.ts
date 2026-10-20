@@ -10,6 +10,8 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  // Target-issue row returned by the checkout lookup (null = issue absent).
+  issueRow: Record<string, unknown> | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -17,9 +19,16 @@ function counterDb(
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
         where: () => {
-          if (Object.keys(selection).includes("count")) {
+          const keys = Object.keys(selection);
+          if (keys.includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          if (keys.includes("checkoutRunId")) {
+            // Timer-wake checkout lookup: select({ id, checkoutRunId, executionRunId }).from(issues).where(...).then(...)
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(issueRow === null ? [] : [issueRow]),
             };
           }
           return {
@@ -237,5 +246,140 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([
       expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
     ]);
+  });
+
+  describe("timer-wake runs that hold the target issue's checkout", () => {
+    const company = "22222222-2222-4222-8222-222222222222";
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const agentId = "33333333-3333-4333-8333-333333333333";
+    const targetIssueId = "55555555-5555-4555-8555-555555555555";
+    const sourceIssueId = "44444444-4444-4444-8444-444444444444";
+    const otherRunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // heartbeat_timer wake: the run row exists but carries no source issue.
+    const timerWakeRun = { contextSnapshot: {} };
+    const wokenRun = { contextSnapshot: { issueId: sourceIssueId } };
+    const base = {
+      companyId: company,
+      runId,
+      agentId,
+      targetIssueId,
+      kind: "update",
+    } as const;
+
+    it("treats a timer-wake run's write to its own checked-out issue as same-issue (no cap spend)", async () => {
+      const fake = counterDb(0, timerWakeRun, {
+        id: targetIssueId,
+        checkoutRunId: runId,
+        executionRunId: runId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("accepts an executionRunId-only checkout as the same-issue link", async () => {
+      const fake = counterDb(0, timerWakeRun, {
+        id: targetIssueId,
+        checkoutRunId: null,
+        executionRunId: runId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("treats a woken run's write to the issue it checked out as same-issue", async () => {
+      const fake = counterDb(0, wokenRun, {
+        id: targetIssueId,
+        checkoutRunId: runId,
+        executionRunId: runId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+      expect(fake.inserted).toEqual([]);
+    });
+
+    const withoutCheckout: Array<[string, Record<string, unknown> | null]> = [
+      ["an unknown target issue", null],
+      [
+        "an issue checked out by another run",
+        { id: targetIssueId, checkoutRunId: otherRunId, executionRunId: otherRunId },
+      ],
+    ];
+    it.each(withoutCheckout)(
+      "still counts a timer-wake write when the run does not hold the checkout (%s)",
+      async (_label, issueRow) => {
+        const fake = counterDb(0, timerWakeRun, issueRow);
+
+        await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toMatchObject({
+          allowed: true,
+          count: 1,
+          cap: CROSS_ISSUE_INFLUENCE_LIMIT,
+        });
+        expect(fake.inserted).toEqual([
+          expect.objectContaining({
+            action: "issue.cross_issue_influence_observed",
+            details: expect.objectContaining({ sourceIssueId: null, targetIssueId }),
+          }),
+        ]);
+      },
+    );
+
+    it("keeps attributing a woken run's foreign-issue write to its source issue", async () => {
+      const fake = counterDb(0, wokenRun, {
+        id: targetIssueId,
+        checkoutRunId: otherRunId,
+        executionRunId: otherRunId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toMatchObject({
+        allowed: true,
+        count: 1,
+      });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          action: "issue.cross_issue_influence_observed",
+          details: expect.objectContaining({ sourceIssueId, targetIssueId }),
+        }),
+      ]);
+    });
+
+    it("still rejects a timer-wake run's foreign write once the cap is spent", async () => {
+      const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, timerWakeRun, {
+        id: targetIssueId,
+        checkoutRunId: otherRunId,
+        executionRunId: otherRunId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        ...base,
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({
+        allowed: false,
+        count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+      });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+      ]);
+    });
+
+    it("skips the checkout lookup for a non-UUID target id and still counts the write", async () => {
+      // If the lookup ran for this id, the stubbed checkout row would make the
+      // write same-issue; a decision here proves the isUuidLike gate held.
+      const fake = counterDb(0, timerWakeRun, {
+        id: targetIssueId,
+        checkoutRunId: runId,
+        executionRunId: runId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        ...base,
+        targetIssueId: "TASK-482",
+        targetIssueIdentifier: "TASK-482",
+      })).resolves.toMatchObject({ allowed: true, count: 1 });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_observed" }),
+      ]);
+    });
   });
 });
