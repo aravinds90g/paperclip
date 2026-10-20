@@ -113,8 +113,10 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
         // run. This harness persists no issue rows, so no run holds an issue
         // here and every write keeps its existing accounting.
         if (Object.keys(selection).includes("heldId")) {
+          const then = (resolve: (rows: unknown[]) => unknown) => resolve([]);
           return {
-            then: (resolve: (rows: unknown[]) => unknown) => resolve([]),
+            limit: () => ({ then }),
+            then,
           };
         }
         const run = mockRunAttribution.value;

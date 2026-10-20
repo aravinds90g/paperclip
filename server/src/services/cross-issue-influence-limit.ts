@@ -137,6 +137,11 @@ export async function observeCrossIssueInfluence(
     // issues this run does not hold keep the existing behavior — cross-issue cap
     // accounting below, unchanged. Same-issue writes by source issue return
     // above, so this query never runs for them.
+    //
+    // The lookup is capped at two rows: one row proves the target is the sole
+    // claim, two rows prove it is not, and anything beyond two cannot change
+    // that verdict. `issues_company_checkout_run_idx` and
+    // `issues_company_execution_run_idx` keep it off a company-wide scan.
     const heldIssueIds = isUuidLike(input.targetIssueId)
       ? await tx
           .select({ heldId: issues.id })
@@ -145,6 +150,7 @@ export async function observeCrossIssueInfluence(
             eq(issues.companyId, input.companyId),
             or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
           ))
+          .limit(2)
           .then((rows) => rows.map((row) => row.heldId))
       : [];
     if (heldIssueIds.length === 1 && heldIssueIds[0] === input.targetIssueId) {

@@ -30,10 +30,12 @@ function counterDb(
             }
             if (keys.includes("heldId")) {
               // The timer-wake checkout lookup:
-              // select({ heldId: issues.id }).from(issues).where(...).then(...)
+              // select({ heldId: issues.id }).from(issues).where(...).limit(2).then(...)
+              const then = (resolve: (rows: unknown[]) => unknown) =>
+                resolve(heldIssueIds.slice(0, 2).map((id) => ({ heldId: id })));
               return {
-                then: (resolve: (rows: unknown[]) => unknown) =>
-                  resolve(heldIssueIds.map((id) => ({ heldId: id }))),
+                limit: () => ({ then }),
+                then,
               };
             }
             return {
