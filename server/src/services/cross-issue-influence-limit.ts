@@ -1,4 +1,4 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -127,29 +127,27 @@ export async function observeCrossIssueInfluence(
     // context snapshot, but a successful checkout stamps the issue's active run
     // onto the issue row itself (checkoutRunId / executionRunId). For that case
     // the checkout is the durable same-issue link, so a write from the run that
-    // holds the target issue's active checkout is same-issue influence: it
-    // returns no decision and spends no cap. The lookup runs only after the
-    // source-issue check above, so same-issue writes never pay for it. Writes to
-    // issues this run does not hold a checkout for keep the existing behavior —
-    // then cross-issue cap accounting below, unchanged.
-    const targetIssue = isUuidLike(input.targetIssueId)
+    // holds the target issue is same-issue influence: it returns no decision and
+    // spends no cap.
+    //
+    // The exemption covers only the run's sole held issue. One run can reference
+    // several issues at once (stale or concurrent execution and checkout claims),
+    // so charging every write once a run claims more than one issue keeps the
+    // cap meaningful: stacking checkouts must not buy uncapped writes. Writes to
+    // issues this run does not hold keep the existing behavior — cross-issue cap
+    // accounting below, unchanged. Same-issue writes by source issue return
+    // above, so this query never runs for them.
+    const heldIssueIds = isUuidLike(input.targetIssueId)
       ? await tx
-          .select({
-            id: issues.id,
-            checkoutRunId: issues.checkoutRunId,
-            executionRunId: issues.executionRunId,
-          })
+          .select({ heldId: issues.id })
           .from(issues)
           .where(and(
-            eq(issues.id, input.targetIssueId),
             eq(issues.companyId, input.companyId),
+            or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
           ))
-          .then((rows) => rows[0] ?? null)
-      : null;
-    if (
-      targetIssue &&
-      (targetIssue.checkoutRunId === run.id || targetIssue.executionRunId === run.id)
-    ) {
+          .then((rows) => rows.map((row) => row.heldId))
+      : [];
+    if (heldIssueIds.length === 1 && heldIssueIds[0] === input.targetIssueId) {
       return null;
     }
 
