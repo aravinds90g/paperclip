@@ -109,6 +109,14 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
               resolve([{ count: mockCrossIssueInfluence.priorCount }]),
           };
         }
+        // The timer-wake checkout lookup selects the target issue's checkout
+        // columns. This harness persists no issue rows, so no run holds a
+        // checkout here and every write keeps its existing accounting.
+        if (Object.keys(selection).includes("checkoutRunId")) {
+          return {
+            then: (resolve: (rows: unknown[]) => unknown) => resolve([]),
+          };
+        }
         const run = mockRunAttribution.value;
         return {
           for: () => ({

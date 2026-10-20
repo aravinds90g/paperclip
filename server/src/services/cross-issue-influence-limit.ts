@@ -115,15 +115,23 @@ export async function observeCrossIssueInfluence(
     // rejecting these writes as run-less left live heartbeat runs unable to
     // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
+    ) {
+      return null;
+    }
 
     // A timer-woken run (heartbeat_timer) carries no source issue in its
     // context snapshot, but a successful checkout stamps the issue's active run
     // onto the issue row itself (checkoutRunId / executionRunId). For that case
     // the checkout is the durable same-issue link, so a write from the run that
     // holds the target issue's active checkout is same-issue influence: it
-    // returns no decision and spends no cap. Writes to issues this run does not
-    // hold a checkout for keep the existing behavior below — same-issue only by
-    // source issue, then cross-issue cap accounting.
+    // returns no decision and spends no cap. The lookup runs only after the
+    // source-issue check above, so same-issue writes never pay for it. Writes to
+    // issues this run does not hold a checkout for keep the existing behavior —
+    // then cross-issue cap accounting below, unchanged.
     const targetIssue = isUuidLike(input.targetIssueId)
       ? await tx
           .select({
@@ -141,14 +149,6 @@ export async function observeCrossIssueInfluence(
     if (
       targetIssue &&
       (targetIssue.checkoutRunId === run.id || targetIssue.executionRunId === run.id)
-    ) {
-      return null;
-    }
-
-    if (
-      sourceIssueId !== null &&
-      (sourceIssueId === input.targetIssueId ||
-        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
