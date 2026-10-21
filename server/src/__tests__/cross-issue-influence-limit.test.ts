@@ -16,6 +16,7 @@ function counterDb(
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
   const selects: Array<string[]> = [];
+  const updates: Array<Record<string, unknown>> = [];
   const tx = {
     select: (selection: Record<string, unknown>) => {
       selects.push(Object.keys(selection));
@@ -46,6 +47,9 @@ function counterDb(
                   agentId: "33333333-3333-4333-8333-333333333333",
                   responsibleUserId: "user-1",
                   contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+                  // The one issue this run may write to uncapped; bound lazily
+                  // on the first checked-out same-issue write.
+                  homeIssueId: null,
                   ...runOverrides,
                 }]),
               }),
@@ -60,6 +64,15 @@ function counterDb(
         if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
       },
     }),
+    // update(heartbeatRuns).set({ homeIssueId }).where(...): the lazy home-issue bind.
+    update: () => ({
+      set: (value: Record<string, unknown>) => ({
+        where: async () => {
+          updates.push(value);
+          return [];
+        },
+      }),
+    }),
   };
   return {
     db: {
@@ -67,6 +80,7 @@ function counterDb(
     },
     inserted,
     selects,
+    updates,
     get observedCount() {
       return observedCount;
     },
@@ -382,6 +396,63 @@ describe("cross-issue influence limit rollout", () => {
           action: "issue.cross_issue_influence_observed",
           details: expect.objectContaining({ sourceIssueId: null, targetIssueId }),
         }),
+      ]);
+    });
+
+    it("binds the run's home issue on its first checked-out same-issue write", async () => {
+      // First exemption is recorded durably on the run row so that later
+      // checkouts cannot inherit it.
+      const fake = counterDb(0, timerWakeRun, [targetIssueId]);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+      expect(fake.updates).toEqual([{ homeIssueId: targetIssueId }]);
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("keeps exempting the bound issue when its claim is released and taken again", async () => {
+      const fake = counterDb(0, { ...timerWakeRun, homeIssueId: targetIssueId }, [targetIssueId]);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+      expect(fake.updates).toEqual([]);
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("charges a successive sole claim once the run's exemption is bound to another issue", async () => {
+      // The run already spends its exemption on otherIssueId (checked out,
+      // written, released). Checking out targetIssueId next must not open a
+      // second uncapped channel: the write is counted like any cross-issue one.
+      const fake = counterDb(0, { ...timerWakeRun, homeIssueId: otherIssueId }, [targetIssueId]);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toMatchObject({
+        allowed: true,
+        count: 1,
+        cap: CROSS_ISSUE_INFLUENCE_LIMIT,
+      });
+      expect(fake.updates).toEqual([]);
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          action: "issue.cross_issue_influence_observed",
+          details: expect.objectContaining({ sourceIssueId: null, targetIssueId }),
+        }),
+      ]);
+    });
+
+    it("still rejects a successive sole claim once the run's cap is spent", async () => {
+      const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, {
+        ...timerWakeRun,
+        homeIssueId: otherIssueId,
+      }, [targetIssueId]);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        ...base,
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({
+        allowed: false,
+        count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+      });
+      expect(fake.updates).toEqual([]);
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
       ]);
     });
   });

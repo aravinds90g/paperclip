@@ -96,8 +96,12 @@ const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })))
 // persisted context snapshot names the source issue) and the observation count.
 const mockCrossIssueInfluence = vi.hoisted(() => ({
   sourceIssueId: null as string | null,
+  // The one issue the writing run may write to uncapped (bound lazily on its
+  // first checked-out same-issue write).
+  homeIssueId: null as string | null,
   priorCount: 0,
   inserted: [] as Array<Record<string, unknown>>,
+  bound: [] as Array<Record<string, unknown>>,
 }));
 const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) => unknown) => callback({
   select: (selection: Record<string, unknown>) => ({
@@ -129,6 +133,7 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
                   agentId: run.agentId ?? null,
                   responsibleUserId: run.responsibleUserId ?? null,
                   contextSnapshot: { issueId: mockCrossIssueInfluence.sourceIssueId },
+                  homeIssueId: mockCrossIssueInfluence.homeIssueId,
                 }]
               : []),
           }),
@@ -141,6 +146,16 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
       mockCrossIssueInfluence.inserted.push(value);
       if (value.action === "issue.cross_issue_influence_observed") mockCrossIssueInfluence.priorCount += 1;
     },
+  }),
+  // update(heartbeatRuns).set(...).where(...): the lazy home-issue bind, which
+  // only runs once a run actually holds a target issue.
+  update: () => ({
+    set: (value: Record<string, unknown>) => ({
+      where: async () => {
+        mockCrossIssueInfluence.bound.push(value);
+        return [];
+      },
+    }),
   }),
 })));
 const mockDb = vi.hoisted(() => ({

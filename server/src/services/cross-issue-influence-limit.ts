@@ -1,4 +1,4 @@
-import { and, count, eq, or } from "drizzle-orm";
+import { and, count, eq, isNull, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -92,6 +92,7 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        homeIssueId: heartbeatRuns.homeIssueId,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -142,6 +143,14 @@ export async function observeCrossIssueInfluence(
     // claim, two rows prove it is not, and anything beyond two cannot change
     // that verdict. `issues_company_checkout_run_idx` and
     // `issues_company_execution_run_idx` keep it off a company-wide scan.
+    //
+    // A sole claim is not enough on its own: checkout and release are free, so a
+    // run could check out issue A, write, release it, then repeat for B and
+    // every later issue, never holding two claims at once. The run row therefore
+    // carries the one issue this run may write to uncapped. It is bound on the
+    // first checked-out same-issue write and never rebound, so releasing the
+    // bound issue cannot open a second uncapped channel. The run row is already
+    // locked above, so the lazy bind cannot race another write from this run.
     const heldIssueIds = isUuidLike(input.targetIssueId)
       ? await tx
           .select({ heldId: issues.id })
@@ -154,7 +163,22 @@ export async function observeCrossIssueInfluence(
           .then((rows) => rows.map((row) => row.heldId))
       : [];
     if (heldIssueIds.length === 1 && heldIssueIds[0] === input.targetIssueId) {
-      return null;
+      if (run.homeIssueId === input.targetIssueId) {
+        return null;
+      }
+      if (run.homeIssueId === null) {
+        await tx
+          .update(heartbeatRuns)
+          .set({ homeIssueId: input.targetIssueId })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.companyId, input.companyId),
+            isNull(heartbeatRuns.homeIssueId),
+          ));
+        return null;
+      }
+      // The run already spends its exemption on another issue; a fresh claim of
+      // a second issue is cross-issue influence and is accounted for below.
     }
 
     const priorCount = await tx
